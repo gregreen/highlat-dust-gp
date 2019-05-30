@@ -74,9 +74,11 @@ class RationalQuadraticKernel(Kernel):
         )
 
     def forward(self, x1, x2, **params):
+        #print(f'x1.shape = {x1.shape}')
+        #print(f'x2.shape = {x2.shape}')
         dist2 = self.covar_dist(x1, x2, square_dist=True, **params)
         scaled_dist2 = dist2.div(
-                self.lengthscale.pow(2).mul(self.power_law.mul(2))
+            self.lengthscale.pow(2).mul(self.power_law.mul(2))
         )
         res = scaled_dist2.add(1).pow(self.power_law.mul(-1))
 
@@ -87,8 +89,12 @@ class RationalQuadraticKernel(Kernel):
         #print(res)
         #print(res_est)
 
-        if dist2.ndimension() == 2:
+        if (dist2.ndimension() == 2) or params.get('diag', False):
             res = res.squeeze(0)
+
+        #print(f'res.shape = {res.shape}')
+        #print('')
+
         return res
 
 

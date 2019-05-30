@@ -14,14 +14,11 @@ import json
 from matplotlib import pyplot as plt
 
 from rq_kernel import RationalQuadraticKernel
-from exp_kernel import ExponentialKernel
 from sph_harmonic_mean import SphericalHarmonicMean
-
-from progressbar import progressbar
 
 
 class ExactGPModel(gpytorch.models.ExactGP):
-    def __init__(self, train_x, train_y, likelihood):
+    def __init__(self, train_x, train_y, likelihood, output_device, n_devices):
         super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
 
         # Mean
@@ -30,23 +27,24 @@ class ExactGPModel(gpytorch.models.ExactGP):
         self.mean_module = SphericalHarmonicMean(prior=a_lm_prior)
 
         # Kernel
-        alpha_prior = gpytorch.priors.NormalPrior(2.25, 0.01)
-        ell_prior = gpytorch.priors.NormalPrior(0., np.radians(0.1))
+        alpha_prior = gpytorch.priors.NormalPrior(4.5, 2.0)
+        ell_prior = gpytorch.priors.NormalPrior(0., np.radians(0.5))
         base_kernel = RationalQuadraticKernel(
             power_law_prior=alpha_prior,
             lengthscale_prior=ell_prior
         )
 
         # Scale kernel to get overall variance
-        kernel = gpytorch.kernels.ScaleKernel(base_kernel)
-        self.covar_module = kernel
-
-        # Set parameters to default
-        self.set_parameters(
-            alpha=4.5,
-            ell=np.radians(0.5),
-            a_lm = np.zeros(16)
+        scaled_kernel = gpytorch.kernels.ScaleKernel(base_kernel)
+        
+        # Wrap kernel for multiple GPUs
+        kernel = gpytorch.kernels.MultiDeviceKernel(
+            scaled_kernel,
+            device_ids=range(n_devices),
+            output_device=output_device
         )
+        
+        self.covar_module = kernel
 
     def forward(self, x):
         mean_x = self.mean_module(x)
@@ -64,7 +62,7 @@ class ExactGPModel(gpytorch.models.ExactGP):
             self.mean_module.a_lm = a_lm
 
 
-def load_sources(fname, restrict=False):
+def load_sources(fname):
     chisq, metadata, pctiles = [], [], []
 
     with h5py.File(fname, 'r') as f:
@@ -75,15 +73,6 @@ def load_sources(fname, restrict=False):
 
             l0,b0 = hp.pixelfunc.pix2ang(32, int(pix),
                                          nest=True, lonlat=True)
-
-            if restrict:
-                l0 = np.mod(l0, 360.)
-                if l0 > 180.:
-                    l0 -= 360.
-                if (np.abs(l0) > 15.) or (b0 > 50.):
-                    if np.random.random() > 0.05:
-                        continue
-
             #print('(l,b) = ({:.2f}, {:.2f})'.format(l0, b0))
 
             chisq.append(f['chisq'][pix][:])
@@ -180,18 +169,26 @@ def extract_train_test_data(d, n_train, n_test, log=True):
 
 
 def get_model(data):
+    # Likelihood
     #likelihood = gpytorch.likelihoods.GaussianLikelihood()
     likelihood = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(
-        noise=data['train']['var_y']+0.1**2,
+        noise=data['train']['var_y'],
         learn_additional_noise=False
     )
     #likelihood.noise = 0.10
+    
+    # Determine which GPUs to use
+    output_device = torch.device('cuda:0')
+    n_devices = torch.cuda.device_count()
+    print(f'Planning to run on {n_devices} GPUs.')
 
+    # Set up model
     model = ExactGPModel(
         data['train']['x'],
         data['train']['y'],
         likelihood
     )
+    
     return model, likelihood
 
 
@@ -208,6 +205,7 @@ def get_progress_fn(model):
             '  A={: >5.3f}'
             '  ell={: >5.3f}'
             '  alpha={: >5.3f}'
+            '  noise={: >5.3f}'
         )
 
         def progress(i, n_iter, loss):
@@ -225,6 +223,7 @@ def get_progress_fn(model):
                 model.covar_module.outputscale.item(),
                 np.degrees(model.covar_module.base_kernel.lengthscale.item()),
                 model.covar_module.base_kernel.power_law.item(),
+                model.likelihood.noise.tolist()[0]
             )
             return txt
         
@@ -424,31 +423,19 @@ def plot_results(fname, data, model, likelihood,
     # Evaluate GP mean
     with torch.no_grad(), gpytorch.settings.fast_pred_var(), \
          gpytorch.beta_features.checkpoint_kernel(checkpoint_size):
-        print('eval')
-        model.eval()
-        likelihood.eval()
-        print('eval done')
-
-        #grid_pred = likelihood(model(c_grid))
-        print('grid_pred')
-        grid_pred = model(c_grid)
-        print('grid_pred done')
+        grid_pred = likelihood(model(c_grid))
         grid_pred_mean = grid_pred.mean.view(plot_size, plot_size).numpy()
-        grid_pred_var = grid_pred.variance.view(plot_size, plot_size).numpy()
-        #test_pred = likelihood(model(data['test']['x']))
-        print('test_pred')
-        test_pred = model(data['test']['x'])
+        test_pred = likelihood(model(data['test']['x']))
         test_pred_mean = test_pred.mean.numpy()
-        print('test_pred done')
 
     # Create figure
-    fig = plt.figure(figsize=(24, 12), dpi=200)
+    fig = plt.figure(figsize=(18, 12), dpi=200)
 
     vmin, vmax = np.percentile(data['all']['y'], [2., 98.])
     gridsize = 25
 
     # Smooth GP prediction
-    ax = fig.add_subplot(2,4,1)
+    ax = fig.add_subplot(2,3,1)
     ax.set_title('Smooth Prediction')
     im = ax.imshow(
         grid_pred_mean,
@@ -465,34 +452,11 @@ def plot_results(fname, data, model, likelihood,
         alpha=0.5,
         c='w',
         edgecolors='none',
-        s=1
+        s=3
     )
 
-    ax = fig.add_subplot(2,4,2)
-    ax.set_title('Smooth Prediction')
-    im = ax.imshow(
-        grid_pred_mean,
-        origin='lower',
-        extent=extent,
-        vmin=vmin,
-        vmax=vmax,
-        aspect='auto'
-    )
-    fig.colorbar(im, ax=ax)
-
-    # Std. dev. of prediction
-    ax = fig.add_subplot(2,4,3)
-    ax.set_title(r'$\sigma$')
-    im = ax.imshow(
-        np.sqrt(grid_pred_var),
-        origin='lower',
-        extent=extent,
-        aspect='auto'
-    )
-    fig.colorbar(im, ax=ax)
-
-    # Measured values
-    ax = fig.add_subplot(2,4,4)
+    # True values
+    ax = fig.add_subplot(2,3,2)
     ax.set_title('All data')
     im = ax.hexbin(
         c_proj_data[:,0], c_proj_data[:,1],
@@ -522,7 +486,7 @@ def plot_results(fname, data, model, likelihood,
     #    ax.grid(True)
     
     # Prediction at test points
-    ax = fig.add_subplot(2,4,5)
+    ax = fig.add_subplot(2,3,4)
     ax.set_title('Prediction at test points')
     im = ax.hexbin(
         c_proj_test[:,0], c_proj_test[:,1],
@@ -534,9 +498,9 @@ def plot_results(fname, data, model, likelihood,
     ax.set_ylim(extent[2:])
     fig.colorbar(im, ax=ax)
 
-    # Measured values at test points
-    ax = fig.add_subplot(2,4,6)
-    ax.set_title('Measured values at test points')
+    # True values at test points
+    ax = fig.add_subplot(2,3,5)
+    ax.set_title('True values at test points')
     im = ax.hexbin(
         c_proj_test[:,0], c_proj_test[:,1],
         C=data['test']['y'], reduce_C_function=np.mean,
@@ -548,7 +512,7 @@ def plot_results(fname, data, model, likelihood,
     fig.colorbar(im, ax=ax)
 
     # Residuals at test points
-    ax = fig.add_subplot(2,4,7)
+    ax = fig.add_subplot(2,3,6)
     ax.set_title('Residuals at test points')
     resid = test_pred_mean - data['test']['y'].numpy()
     vmax = np.percentile(np.abs(resid), 95.)
@@ -557,21 +521,6 @@ def plot_results(fname, data, model, likelihood,
         C=resid, reduce_C_function=np.mean,
         gridsize=gridsize,
         vmin=-vmax, vmax=vmax, cmap='coolwarm_r'
-    )
-    ax.set_xlim(extent[:2])
-    ax.set_ylim(extent[2:])
-    fig.colorbar(im, ax=ax)
-
-    # Chi^2 at test points
-    ax = fig.add_subplot(2,4,8)
-    ax.set_title(r'$\chi^2 \ \mathrm{at\ test\ points}$')
-    chi2 = resid**2 / (data['test']['var_y'].numpy() + 0.1**2)
-    vmax = np.percentile(np.abs(resid), 95.)
-    im = ax.hexbin(
-        c_proj_test[:,0], c_proj_test[:,1],
-        C=chi2, reduce_C_function=np.mean,
-        gridsize=gridsize,
-        vmin=0., vmax=5.
     )
     ax.set_xlim(extent[:2])
     ax.set_ylim(extent[2:])
@@ -617,8 +566,7 @@ def rational_quadratic(r, l, a):
 def plot_kernel_grid(fname, data, model, likelihood,
                      proj, inv_proj,
                      plot_size=100,
-                     plot_training=True,
-                     checkpoint_size=5000):
+                     plot_training=True):
     # Get grid of coordinates to plot
     extent, c_grid = get_coord_grid(data, proj, inv_proj, plot_size)
 
@@ -649,23 +597,15 @@ def plot_kernel_grid(fname, data, model, likelihood,
             likelihood.eval()
 
             # Evaluate GP at grid points
-            with torch.no_grad(), gpytorch.settings.fast_pred_var(), \
-                 gpytorch.beta_features.checkpoint_kernel(checkpoint_size):
-                print('likelihood')
+            with torch.no_grad(), gpytorch.settings.fast_pred_var():
                 grid_pred = likelihood(model(c_grid))
-                print('done')
 
             for sample in [True, False]:
-                #with torch.no_grad(), gpytorch.settings.fast_pred_var(), \
-                #     gpytorch.beta_features.checkpoint_kernel(checkpoint_size):
                 # Either sample or take mean of distribution
                 if sample:
-                    print('sample')
                     grid_pred_value = grid_pred.sample()
                 else:
-                    print('mean')
                     grid_pred_value = grid_pred.mean
-                print('done')
 
                 grid_pred_value = grid_pred_value.view(
                     plot_size, plot_size
@@ -715,121 +655,80 @@ def plot_kernel_grid(fname, data, model, likelihood,
         plt.close(fig)
 
 
-def empirical_covariance(x, y, d_max=1., n_d=100, block_size=1000):
-    # Calculate distances
-    n_blocks = x.shape[0] // block_size
-    d_edges = np.linspace(0., d_max, n_d+1)
-    d_mean = 0.5 * (d_edges[:-1] + d_edges[1:])
-    n = np.zeros(n_d, dtype='u8')
-    sum_covar = np.zeros(n_d, dtype='f8')
+def get_data():
+    fname = 'data/gp_data.h5'
+    
+    if os.path.isfile(fname):
+        with h5py.File(fname, 'r') as f:
+            data = {
+                k0: {k1: f[k0][k1][:] for k1 in ('x','y','var_y')}
+                for k0 in ('train', 'test', 'all')
+            }
+    else:
+        # Load data
+        fname_orig = 'data/stellar_params_highlat_thinned.h5'
 
-    for b in progressbar(range(n_blocks)):
-        i0 = b*block_size
-        i1 = (b+1)*block_size
-        d2 = np.sum((x[i0:i1,None,:] - x[None,:,:])**2, axis=2)
+        data = load_sources(fname_orig)
+        data = filter_sources(data, E_min=-0.30, sigma_E_max=0.10, d_min=500.)
+        data = extract_train_test_data(data, 1000, 1000, log=False)
         
-        for k,(d0,d1) in enumerate(zip(d_edges[:-1],d_edges[1:])):
-            idx = (d2 > d0**2) & (d2 <= d1**2)
-            idx0,idx1 = np.where(idx)
-            n[k] += np.count_nonzero(idx0)
-            sum_covar[k] += np.sum(y[i0:i1][idx0]*y[idx1])
-
-    covar = sum_covar / n
-    print('   d    '
-          '  covar     '
-          '    n   ')
-    for dd,cv,nn in zip(np.degrees(d_mean), covar, n):
-        print(f'{dd: >5.2f}  {cv: >+10.7f}  {nn: >8d}')
-
-    # Model kernel
-    #A = model.covar_module.outputscale.item()
-    #ell = model.covar_module.base_kernel.lengthscale.item()
-    #alpha = model.covar_module.base_kernel.power_law.item()
-    #print(f'A = {A}')
-    #print(f'ell = {ell}')
-    #print(f'alpha = {alpha}')
-    #K_model = A**2. * (1. + d_mean**2./(2.*alpha*ell**2.))**(-alpha)
-    #K_model = np.zeros(d_mean.shape)
-
-    A = 0.0014
-    ell = np.radians(5.)
-    K_model = A * np.exp(-d_mean/ell)
-
-    # Plot
-    fig = plt.figure(figsize=(8,5), dpi=200)
-    ax = fig.add_subplot(1,1,1)
-    ax.plot(np.degrees(d_mean), covar)
-    ax.plot(np.degrees(d_mean), K_model)
-    ax.set_xlabel(r'$\left| x^{\prime} - x \right|$')
-    ax.set_ylabel(r'$\left< \delta y^{\prime} \delta y \right>$')
-    fig.savefig('cov_emp.png', dpi=200)
+        # Write filtered data to file
+        with h5py.File(fname, 'w') as f:
+            for k0 in ('train', 'test', 'all'):
+                for k1 in ('x', 'y', 'var_y'):
+                    f.create_dataset(
+                        fr'/{k0}/{k1)',
+                        data=data[k0][k1]
+                        compression='lzip'
+                    )
+    
+    return data
 
 
 def main():
     # Load data
-    fname = 'stellar_params_highlat_thinned.h5'
-
-    data = load_sources(fname, restrict=False)
-    data = filter_sources(data, E_min=-0.30, sigma_E_max=0.10, d_min=500.)
-    data = extract_train_test_data(data, 10000, 3000, log=False)
+    data = get_data()
 
     # Set up model
     model, likelihood = get_model(data)
-    fname = 'model_clump_random.json'
+    fname = 'model.json'
+    
+    return 0
     
     # Plot grid of predictions with different kernel parameters
     #plot_kernel_grid(
-    #    'kernel_grid_1_{}.png',
+    #    'kernel_grid_{}.png',
     #    data, model, likelihood,
     #    proj_stereo_c2xy, proj_stereo_xy2c,
-    #    plot_size=150,
+    #    plot_size=50,
     #)
 
     # Load the model
     print('Loading model from {:s}'.format(fname))
     load_model(model, fname)
-    x = data['all']['x']
-    y = data['all']['y']
-    idx = np.arange(y.size)
-    np.random.shuffle(idx)
-    idx = idx[::5]
-    x = x[idx]
-    y = y[idx]
-    y0 = model.mean_module(torch.from_numpy(x)).detach().numpy()
-    dy = y - y0
-    print(np.mean(dy))
-    dy -= np.mean(dy)
-    empirical_covariance(
-        x, dy,
-        d_max=np.radians(30.)
-    )
-    return 0
-    model.set_parameters(alpha=2.25, ell=np.radians(0.5))
 
     # Train the model
-    #train_model(10, data, model, likelihood,
-    #            checkpoint_size=3000)
+    model.set_parameters(ell=np.radians(0.5), alpha=2.25)
+    train_model(10, data, model, likelihood)
 
     # Save the model
-    fname = 'model_clump_random_alpha2.25_ell0.5.json'
     print('Saving model to {:s}'.format(fname))
     save_model(model, fname)
 
     # Test the model
-    #test_y_var = test_variance(data, model, likelihood)
-    #raw_y_var = np.var(data['test']['y'].numpy())
-    #print('Test variance: {:.3f} (raw)'.format(raw_y_var))
-    #print('               {:.3f} (pred)'.format(test_y_var))
+    test_y_var = test_variance(data, model, likelihood)
+    raw_y_var = np.var(data['test']['y'].numpy())
+    print('Test variance: {:.3f} (raw)'.format(raw_y_var))
+    print('               {:.3f} (pred)'.format(test_y_var))
 
     # Plot the results
-    fname = 'results_clump_random_alpha2.25_ell0.5.png'
+    fname = 'results.png'
     plot_results(
         fname, data, model, likelihood,
         proj_stereo_c2xy, proj_stereo_xy2c,
         #proj_c2xy, proj_xy2c,
         #proj_c2lonlat, proj_lonlat2c,
-        plot_size=200,
-        checkpoint_size=4000
+        plot_size=200
     )
 
     return 0
